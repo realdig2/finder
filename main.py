@@ -40,35 +40,52 @@ def load_proxies_from_file(filename):
         proxies = [line.strip() for line in file]
     return proxies
 
-def get_group_status(group_id, proxy):
+def check_ownerless_groups_v2(group_ids, proxy):
+    url = f"https://groups.roblox.com/v2/groups?groupIds={','.join(map(str, group_ids))}"
+    try:
+        response = requests.get(url, proxies={"http": proxy, "https": proxy})
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        return []
+    except requests.RequestException:
+        return []
+
+def check_public_entry_v1(group_id, proxy):
     url = f"https://groups.roblox.com/v1/groups/{group_id}"
     try:
         response = requests.get(url, proxies={"http": proxy, "https": proxy})
         if response.status_code == 200:
             group_data = response.json()
-            if group_data.get('publicEntryAllowed') is False:
-                return 'locked'
-            elif group_data.get('owner') is None:
-                return 'ownerless'
-            else:
-                return 'owned'
-        return 'error'
+            return group_data.get('publicEntryAllowed', False)
+        return False
     except requests.RequestException:
-        return 'error'
+        return False
 
 def check_group_status(batch_group_ids, webhook_url, proxy, lock, count_queue, max_retries=3):
-    for group_id in batch_group_ids:
-        status = get_group_status(group_id, proxy)
-        with lock:
-            count_queue.put((time.time(), 1))  # Increment scan count
+    ownerless_groups = []
+    
+    group_data = check_ownerless_groups_v2(batch_group_ids, proxy)
+    for group in group_data:
+        group_id = group['id']
+        owner = group.get('owner')
 
-        if status == 'locked':
-            print(f"Group ID: {group_id} has owner: locked")
-        elif status == 'ownerless':
-            print(f"Group ID: {group_id} has owner: no")
-            send_webhook_message(webhook_url, f"Group https://roblox.com/groups/{group_id} is ownerless.")
+        with lock:
+            count_queue.put((time.time(), 1))
+        
+        if owner is None:
+            print(f"Group ID: {group_id} is ownerless")
+            time.sleep(0.01)
+            ownerless_groups.append(group_id)
         else:
-            print(f"Group ID: {group_id} has owner: yes")
+            print(f"Group ID: {group_id} has an owner")
+            time.sleep(0.01)
+
+    for group_id in ownerless_groups:
+        if not check_public_entry_v1(group_id, proxy):
+            print(f"Group ID: {group_id} is locked")
+            time.sleep(0.01)
+        else:
+            send_webhook_message(webhook_url, f"Group https://roblox.com/groups/{group_id}")
 
 def stat_updater(count_queue):
     count_cache = {}
@@ -95,13 +112,11 @@ if __name__ == "__main__":
 
     proxies = load_proxies_from_file(proxy_file)
     lock = Lock()
-    count_queue = Queue()  # Queue to track scan counts
+    count_queue = Queue()
     start_time = time.time()
 
     group_ids = list(range(start_id, end_id + 1))
     batch_size = 100
-
-    # Start the stat updater thread
     stat_thread = Thread(target=stat_updater, args=(count_queue,))
     stat_thread.daemon = True
     stat_thread.start()
@@ -110,7 +125,7 @@ if __name__ == "__main__":
         futures = []
         for i in range(0, len(group_ids), batch_size):
             batch_group_ids = group_ids[i:i + batch_size]
-            proxy = proxies[i % len(proxies)]  # Rotate through proxies
+            proxy = proxies[i % len(proxies)]
             future = executor.submit(check_group_status, batch_group_ids, webhook_url, proxy, lock, count_queue)
             futures.append(future)
 
